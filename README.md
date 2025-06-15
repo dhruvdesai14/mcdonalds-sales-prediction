@@ -41,7 +41,7 @@ mcdonalds-sales-prediction/
    pip install -r requirements.txt
    ```
 
-3. Place your dataset file in the `data/` folder.
+3. Make sure the file is in the `data/` folder.
 
 4. Run the script:
    ```bash
