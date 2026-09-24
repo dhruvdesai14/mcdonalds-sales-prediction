@@ -1,8 +1,15 @@
+from pathlib import Path
+
+import holidays
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import StackingRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
@@ -11,14 +18,18 @@ import joblib
 
 RANDOM_STATE = 42
 
-HOLIDAYS = pd.to_datetime([
-    "2023-01-01", "2023-02-20", "2023-04-07", "2023-05-22", "2023-07-01",
-    "2023-08-07", "2023-09-04", "2023-10-09", "2023-11-11", "2023-12-25",
-    "2024-01-01", "2024-02-19", "2024-03-29", "2024-05-20", "2024-07-01",
-    "2024-08-05", "2024-09-02", "2024-10-14", "2024-11-11", "2024-12-25",
-    "2025-01-01", "2025-02-17", "2025-04-18", "2025-05-19", "2025-07-01",
-    "2025-08-04", "2025-09-01", "2025-10-13", "2025-11-11", "2025-12-25",
-])
+ROOT = Path(__file__).resolve().parent.parent
+DATA_PATH = ROOT / "data" / "McDonalds_Canada_Sales_Data_with_Temperature.csv"
+OUTPUT_DIR = ROOT / "output"
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+def canadian_holidays(years):
+    """Ontario public + optional holidays for the given years."""
+    cal = holidays.Canada(subdiv="ON", years=years, categories=("public", "optional"))
+    return pd.to_datetime(list(cal.keys()))
+
 
 
 def load_and_engineer(file_path):
@@ -30,6 +41,8 @@ def load_and_engineer(file_path):
     df["Date"] = pd.to_datetime(df["Date"], format="%d-%m-%Y", dayfirst=True, errors="coerce")
     df["Date"] = df["Date"].ffill()
     df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    years = range(df["Date"].dt.year.min() - 1, df["Date"].dt.year.max() + 2)
+    holiday_dates = canadian_holidays(years)
 
     #-- Detect same-day component columns (lagged, never used raw) -------------
     component_cols = [c for c in df.columns
@@ -40,7 +53,7 @@ def load_and_engineer(file_path):
     #--- Calendar features (known in advance -> no leakage) --------------------
     df["Day_of_Week"] = df["Date"].dt.dayofweek
     df["Month"] = df["Date"].dt.month
-    df["Is_Holiday"] = df["Date"].isin(HOLIDAYS).astype(int)
+    df["Is_Holiday"] = df["Date"].isin(holiday_dates).astype(int)
 
     # --- Lag features (all strictly backward-looking) ----------------------
     lag_cols = []
@@ -63,8 +76,8 @@ def load_and_engineer(file_path):
 
     # Calendar-derived flags (known in advance -> no leakage).
     df["Is_Weekend"] = (df["Day_of_Week"] >= 5).astype(int)
-    df["Day_Before_Holiday"] = (df["Date"] + pd.Timedelta(days=1)).isin(HOLIDAYS).astype(int)
-    df["Day_After_Holiday"] = (df["Date"] - pd.Timedelta(days=1)).isin(HOLIDAYS).astype(int)
+    df["Day_Before_Holiday"] = (df["Date"] + pd.Timedelta(days=1)).isin(holiday_dates).astype(int)
+    df["Day_After_Holiday"] = (df["Date"] - pd.Timedelta(days=1)).isin(holiday_dates).astype(int)
 
     #--- Interaction features (known in advance -> no leakage) ----------------
     if "Local_Event" in df.columns and pd.api.types.is_numeric_dtype(df["Local_Event"]):
@@ -106,15 +119,6 @@ def chronological_split(df, feature_cols, target="Total_Sales", test_size=0.2):
     return X_train, y_train, X_test, y_test, dates_test
 
 
-def remove_training_outliers(X_train, y_train, target_iqr_multiplier=1.5):
-    # Remove outliers from the training target using the IQR method.
-    q1, q3 = y_train.quantile(0.25), y_train.quantile(0.75)
-    iqr = q3 - q1
-    lower, upper = q1 - target_iqr_multiplier * iqr, q3 + target_iqr_multiplier * iqr
-    keep = (y_train >= lower) & (y_train <= upper)
-    return X_train[keep], y_train[keep]
-
-
 def _objective(trial, X_train, y_train, val_fraction=0.2):
     # Split the training data into an internal training and validation set for Optuna hyperparameter tuning.
     inner_split = int(len(X_train) * (1 - val_fraction))
@@ -140,7 +144,8 @@ def _objective(trial, X_train, y_train, val_fraction=0.2):
 
 
 def tune_hyperparameters(X_train, y_train, n_trials=30):
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(direction="minimize",
+                                sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
     study.optimize(lambda t: _objective(t, X_train, y_train), n_trials=n_trials)
     return study.best_params
 
@@ -179,36 +184,72 @@ def get_feature_importance(pipe, feature_cols):
             .sort_values(ascending=False))
 
 
-def export_predictions(dates_test, y_test, preds, path="sales_predictions_results.csv"):
+def export_predictions(dates_test, y_test, preds, path=OUTPUT_DIR / "sales_predictions_results.csv"):
     out = pd.DataFrame({
         "Date": dates_test.values,
         "Actual_Sales": y_test.values,
         "Predicted_Sales": preds,
     })
     out.to_csv(path, index=False)
-    print(f"Predictions exported to '{path}'")
+    print(f"Predictions exported to '{path.relative_to(ROOT)}'")
 
 
-def naive_baselines(X_test, y_test):
-    ## Compute naive baseline predictions using lagged features and return their metrics.
-    results = {}
+def plot_predictions(dates_test, y_test, preds, baseline, path=OUTPUT_DIR / "actual_vs_predicted.png"):
+    fig, ax = plt.subplots(figsize=(11, 4.5))
+    ax.plot(dates_test, y_test, label="Actual", color="#222222", linewidth=1.4)
+    ax.plot(dates_test, preds, label="Stacked model", color="#d62728", linewidth=1.4)
+    ax.plot(dates_test, baseline, label="Baseline: mean by Local_Event",
+            color="#1f77b4", linewidth=1.2, linestyle="--")
+    ax.set_title("Daily sales on the hold-out period: actual vs predicted")
+    ax.set_ylabel("Total sales")
+    ax.legend(loc="upper left")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    print(f"Plot saved to '{path.relative_to(ROOT)}'")
+
+
+def baseline_predictions(X_train, y_train, X_test):
+    """Simple rules the model has to beat, keyed by name."""
+    preds = {"train_mean": pd.Series(y_train.mean(), index=X_test.index)}
+    if "Local_Event" in X_train.columns:
+        event_means = y_train.groupby(X_train["Local_Event"]).mean()
+        preds["mean_by_local_event"] = (X_test["Local_Event"].map(event_means)
+                                        .fillna(y_train.mean()))
     if "Prev_Day_Sales" in X_test.columns:
-        p = X_test["Prev_Day_Sales"]
-        results["yesterday"] = {"mae": mean_absolute_error(y_test, p),
-                                "r2": r2_score(y_test, p)}
+        preds["yesterday"] = X_test["Prev_Day_Sales"]
     if "Prev_Week_Sales" in X_test.columns:
-        p = X_test["Prev_Week_Sales"]
-        results["same_weekday_last_week"] = {"mae": mean_absolute_error(y_test, p),
-                                             "r2": r2_score(y_test, p)}
-    return results
+        preds["same_weekday_last_week"] = X_test["Prev_Week_Sales"]
+    return preds
+
+
+def score_baselines(X_train, y_train, X_test, y_test):
+    return {name: {"mae": mean_absolute_error(y_test, p), "r2": r2_score(y_test, p)}
+            for name, p in baseline_predictions(X_train, y_train, X_test).items()}
+
+
+def walk_forward_cv(df, feature_cols, target="Total_Sales", n_splits=5, n_trials=15):
+    """Expanding-window CV: tune + fit on the past, score on the next block."""
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    X, y = df[feature_cols], df[target]
+    rows = []
+    for fold, (tr, te) in enumerate(tscv.split(X), start=1):
+        X_tr, y_tr, X_te, y_te = X.iloc[tr], y.iloc[tr], X.iloc[te], y.iloc[te]
+        params = tune_hyperparameters(X_tr, y_tr, n_trials=n_trials)
+        preds = train_final_model(X_tr, y_tr, params).predict(X_te)
+        row = {"fold": fold, "model": mean_absolute_error(y_te, preds)}
+        row.update({name: m["mae"]
+                    for name, m in score_baselines(X_tr, y_tr, X_te, y_te).items()})
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("fold")
 
 
 def main():
-    file_path = "McDonalds_Canada_Sales_Data_with_Temperature.csv"
-
-    df, feature_cols = load_and_engineer(file_path)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    df, feature_cols = load_and_engineer(DATA_PATH)
     X_train, y_train, X_test, y_test, dates_test = chronological_split(df, feature_cols)
-    X_train, y_train = remove_training_outliers(X_train, y_train)
+    print(f"Train: {len(X_train)} days, test: {len(X_test)} days")
 
     print("Tuning hyperparameters (Optuna, internal validation split)...")
     best_params = tune_hyperparameters(X_train, y_train, n_trials=30)
@@ -221,27 +262,36 @@ def main():
     print(f"MSE: {metrics['mse']:.2f}")
     print(f"R^2: {metrics['r2']:.3f}")
 
-    #-- Compare against naive baselines (yesterday's sales, same weekday last week) --
-    baselines = naive_baselines(X_test, y_test)
-    print("\nNaive baselines (for comparison):")
-    best_baseline_mae = float("inf")
+    #-- Compare against baselines: the model has to beat the best of them --
+    baselines = score_baselines(X_train, y_train, X_test, y_test)
+    print("\nBaselines (for comparison):")
     for name, m in baselines.items():
         print(f"  {name:<24} MAE: {m['mae']:.2f}  R^2: {m['r2']:.3f}")
-        best_baseline_mae = min(best_baseline_mae, m["mae"])
-    if baselines:
-        if metrics["mae"] < best_baseline_mae:
-            gain = 100 * (best_baseline_mae - metrics["mae"]) / best_baseline_mae
-            print(f"\nVerdict: model beats the best naive baseline by {gain:.1f}% on MAE.")
-        else:
-            print("\nVerdict: model does NOT beat the best naive baseline on MAE. "
-                  "The trivial rule is as good or better here.")
+    best_name = min(baselines, key=lambda n: baselines[n]["mae"])
+    best_mae = baselines[best_name]["mae"]
+    diff = 100 * (best_mae - metrics["mae"]) / best_mae
+    if diff > 0:
+        print(f"\nVerdict: model beats the best baseline ({best_name}) by {diff:.1f}% on MAE.")
+    else:
+        print(f"\nVerdict: model does NOT beat the best baseline ({best_name}); "
+              f"it is {-diff:.1f}% worse on MAE.")
+
+    print("\nWalk-forward CV (5 expanding folds, MAE per fold):")
+    cv = walk_forward_cv(df, feature_cols)
+    print(cv.round(1).to_string())
+    print("\nMean MAE across folds (std):")
+    for col in cv.columns:
+        print(f"  {col:<24} {cv[col].mean():8.1f}  ({cv[col].std():.1f})")
 
     print("\nTop feature importances:")
     print(get_feature_importance(pipe, feature_cols).head(10).to_string())
 
     export_predictions(dates_test, y_test, preds)
-    joblib.dump(pipe, "stacked_sales_model.pkl")
-    print("Model saved to 'stacked_sales_model.pkl'")
+    event_baseline = baseline_predictions(X_train, y_train, X_test)["mean_by_local_event"]
+    plot_predictions(dates_test, y_test, preds, event_baseline)
+    model_path = OUTPUT_DIR / "stacked_sales_model.pkl"
+    joblib.dump(pipe, model_path)
+    print(f"Model saved to '{model_path.relative_to(ROOT)}'")
 
 
 if __name__ == "__main__":
